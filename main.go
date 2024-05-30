@@ -9,6 +9,9 @@ func main() {
 	if err != nil {
 		log.Fatal("Cannot connect to DB")
 	}
+	if err := store.Init(); err != nil {
+		log.Fatal("Table not created: ", err)
+	}
 	server := NewAPIServer(":3000", store)
 	server.Run()
 }
