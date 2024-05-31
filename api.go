@@ -6,11 +6,13 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"reflect"
 	"strconv"
 	"time"
 
 	jwt "github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/mux"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func NewAPIServer(listenAddr string, store Storage) *APIServer {
@@ -22,11 +24,38 @@ func NewAPIServer(listenAddr string, store Storage) *APIServer {
 
 func (s *APIServer) Run() {
 	router := mux.NewRouter()
+	router.HandleFunc("/login", makeHTTPHandlerFunc(s.handleLogin))
 	router.HandleFunc("/account", makeHTTPHandlerFunc(s.handleAccount))
-	router.HandleFunc("/account/{id}", authWithJWT(makeHTTPHandlerFunc(s.handleGetAccountByID)))
+	router.HandleFunc("/account/{id}", authWithJWT(makeHTTPHandlerFunc(s.handleGetAccountByID), s.store))
 	router.HandleFunc("/transfer", makeHTTPHandlerFunc(s.handleTransfer))
 	log.Println("JSON API Server is running on port: ", s.listenAddr)
 	http.ListenAndServe(s.listenAddr, router)
+}
+
+func (s *APIServer) handleLogin(w http.ResponseWriter, r *http.Request) error {
+	if r.Method != "POST" {
+		return fmt.Errorf("METHOD NOT ALLOWED")
+	}
+	var request LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		return err
+	}
+	r.Body.Close()
+	acc, err := s.store.GetAccountByNumber(int(request.Number))
+	if err != nil {
+		return err
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(acc.EncryptedPassword), []byte(request.Password)); err != nil {
+		return err
+	}
+	tokenString, err := createJWT(acc)
+	if err != nil {
+		return err
+	}
+
+	resp := LoginResponse{Token: tokenString, Number: acc.Number}
+	fmt.Println(tokenString)
+	return WriteJSON(w, http.StatusOK, resp)
 }
 
 func (s *APIServer) handleAccount(w http.ResponseWriter, r *http.Request) error {
@@ -70,15 +99,18 @@ func (s *APIServer) handleCreateAccount(w http.ResponseWriter, r *http.Request) 
 	if err := json.NewDecoder(r.Body).Decode(creatAccReq); err != nil {
 		return err
 	}
-	account := NewAccount(creatAccReq.FirstName, creatAccReq.LastName)
-	if err := s.store.CreateAccount(account); err != nil {
-		return err
-	}
-	tokenString, err := createJWT(account)
+	account, err := NewAccount(creatAccReq.FirstName, creatAccReq.LastName, creatAccReq.Password)
 	if err != nil {
 		return err
 	}
-	fmt.Println(tokenString)
+	if err := s.store.CreateAccount(account); err != nil {
+		return err
+	}
+	// tokenString, err := createJWT(account)
+	// if err != nil {
+	// 	return err
+	// }
+	// fmt.Println(tokenString)
 	return WriteJSON(w, http.StatusOK, account)
 }
 
@@ -137,20 +169,40 @@ func getIdFromRequest(r *http.Request) (int, error) {
 }
 
 // Decorator function to act as a middleware niceeeeeeeee
-func authWithJWT(f http.HandlerFunc) http.HandlerFunc {
+func authWithJWT(f http.HandlerFunc, s Storage) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("Authing with JWT")
 		tokenString := r.Header.Get("x-jwt-token")
 		token, err := validateJWT(tokenString)
 		if err != nil {
-			WriteJSON(w, http.StatusForbidden, APIError{Error: "Invalid auth"})
+			WriteJSON(w, http.StatusForbidden, APIError{Error: "bad permission"})
+			log.Println("Cant do validation")
 			return
 		}
 		if !token.Valid {
-			WriteJSON(w, http.StatusForbidden, APIError{Error: "Invalid auth"})
+			WriteJSON(w, http.StatusForbidden, APIError{Error: "bad permission"})
+			log.Println("Token not valid")
+			return
+		}
+		userID, err := getIdFromRequest(r)
+		if err != nil {
+			WriteJSON(w, http.StatusForbidden, APIError{Error: "bad permission"})
+			log.Println("Cant get id from request")
+			return
+		}
+		account, err := s.GetAccountByID(userID)
+		if err != nil {
+			WriteJSON(w, http.StatusForbidden, APIError{Error: "bad permission"})
+			log.Println("Cant get account from db")
 			return
 		}
 		claims := token.Claims.(jwt.MapClaims)
+		if float64(account.Number) != claims["AccountNumber"] {
+			log.Println(reflect.TypeOf(claims["AccountNumber"]))
+			log.Printf("Cant match %v %v\n", account.Number, claims["AccountNumber"])
+			WriteJSON(w, http.StatusForbidden, APIError{Error: "bad permission"})
+			return
+		}
 		fmt.Println(claims)
 		f(w, r)
 	}
